@@ -1,0 +1,7 @@
+name: Content Dependency Tracker
+type: module
+description: Alerts users if content being deleted is referenced by other published entities.
+package: Custom
+core_version_requirement: ^10
+dependencies:
+  - drupal:node

@@ -1,0 +1,7 @@
+content_dependency_tracker.admin_settings:
+  path: '/admin/config/system/content-dependency-tracker'
+  defaults:
+    _form: '\Drupal\content_dependency_tracker\Form\ContentDependencyTrackerAdminForm'
+    _title: 'Content Dependency Tracker Settings'
+  requirements:
+    _permission: 'administer site configuration'

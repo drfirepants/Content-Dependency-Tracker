@@ -1,0 +1,280 @@
+<?php
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityFormInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Url;
+use Drupal\node\NodeInterface;
+use Drupal\Core\Entity\EntityFieldManagerInterface;
+use Drupal\Core\Entity\EntityTypeManagerInterface;
+
+/**
+ * Implements hook_ENTITY_TYPE_predelete() for node entities.
+ */
+function content_dependency_tracker_node_predelete(NodeInterface $node) {
+  $referencing_entities = _content_dependency_tracker_auto_find_references($node);
+
+  if (!empty($referencing_entities)) {
+    // Implement logic to store these references to be displayed to the user.
+    _content_dependency_tracker_store_references($referencing_entities);
+  }
+}
+
+/**
+ * Automatically finds entity reference fields in the node's content type and checks for referenced entities.
+ *
+ * @param NodeInterface $node
+ *   The node entity being checked for references.
+ *
+ * @return array
+ *   An array of entities referencing the node through any entity reference fields in its content type.
+ */
+function _content_dependency_tracker_auto_find_references(EntityInterface $entity, array $fields_to_track = []) {
+  $referencing_entities_info = [];
+  $entity_type_id = $entity->getEntityTypeId();
+  $config = \Drupal::config('content_dependency_tracker.settings');
+  $configured_fields = $config->get('fields_to_track');
+  $entity_type_manager = \Drupal::entityTypeManager();
+  $entity_field_manager = \Drupal::service('entity_field.manager');
+
+  // Retrieve all entity reference fields for the entity type.
+  $all_fields = \Drupal::service('entity_field.manager')->getFieldMapByFieldType('entity_reference');
+
+  // Loop through all entity types that could reference the media.
+  foreach ($all_fields as $potential_referrer_type => $fields) {
+    if ($potential_referrer_type == $entity_type_id) {
+
+      $reference_fields = \Drupal::entityTypeManager()->getStorage('field_storage_config')
+        ->loadByProperties([
+          'type' => 'entity_reference',
+          'settings.target_type' => 'media_type',
+        ]);
+
+      foreach ($fields as $field_name => $field_info) {
+        if (!empty($configured_fields) && !in_array($field_name, $configured_fields)) {
+          continue;
+        }
+
+        $query = \Drupal::entityQuery($potential_referrer_type)
+          ->condition($field_name, $entity->id())
+          ->accessCheck(TRUE);
+        $result = $query->execute();
+
+        if (!empty($result)) {
+          $entity_storage = \Drupal::entityTypeManager()
+            ->getStorage($potential_referrer_type);
+          foreach ($result as $referencing_entity_id) {
+            // Load the referencing entity to get more information.
+            $referencing_entity = $entity_storage->load($referencing_entity_id);
+
+            if ($referencing_entity) {
+              if ($referencing_entity->getEntityTypeId() == 'file') {
+                // For file entities, generate a URL object from the external URL.
+                $uri = $referencing_entity->getFileUri();
+                $external_url = \Drupal::service('stream_wrapper_manager')
+                  ->getViaUri($uri)
+                  ->getExternalUrl();
+                $url = Url::fromUri($external_url);
+              }
+              else {
+                // For other entities with a canonical route, directly use Url::fromRoute().
+                $url = Url::fromRoute("entity.$potential_referrer_type.canonical", ["$potential_referrer_type" => $referencing_entity_id]);
+              }
+
+              $link = Link::fromTextAndUrl($referencing_entity->label(), $url); // $url is now always a Url object.
+
+              // Add information about the referencing entity to the results.
+              $referencing_entities_info[] = [
+                'entity_type' => $potential_referrer_type,
+                'bundle' => $referencing_entity->bundle(),
+                'id' => $referencing_entity_id,
+                'label' => $referencing_entity->label(),
+                'link' => $link,
+              ];
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return $referencing_entities_info;
+}
+
+
+/**
+ * Stores references temporarily to alert users about them before deleting content.
+ *
+ * @param array $references
+ *   The referencing entities data to be stored.
+ */
+function _content_dependency_tracker_store_references(array $references): void {
+  // Get the private temp store service.
+  $tempstore = \Drupal::service('tempstore.private')->get('content_dependency_tracker');
+
+  // Store the references. You could key this by node ID or another unique identifier for the operation.
+  $tempstore->set('references', $references);
+}
+
+function _content_dependency_tracker_retrieve_references(): void {
+  $tempstore = \Drupal::service('tempstore.private')->get('content_dependency_tracker');
+  // Optionally, clear the stored references after displaying them to the user.
+  $tempstore->delete('references');
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for the node delete form.
+ */
+function content_dependency_tracker_form_node_delete_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  // Attach the library for the modal.
+  $form['#attached']['library'][] = 'content_dependency_tracker/modal_display';
+  $form['actions']['submit']['#submit'][] = 'content_dependency_tracker_modal_submit_handler';
+}
+
+function content_dependency_tracker_modal_submit_handler(array &$form, FormStateInterface $form_state) {
+  // Retrieve the stored references.
+  $references = _content_dependency_tracker_retrieve_references();
+
+  if (!empty($references)) {
+    // Prevent the form from submitting.
+    $form_state->setRebuild(TRUE);
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function content_dependency_tracker_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Check if the form is an entity form and specifically for nodes.
+  if ($form_state->getFormObject() instanceof EntityFormInterface) {
+    $entity = $form_state->getFormObject()->getEntity();
+    $config = \Drupal::config('content_dependency_tracker.settings');
+    $selected_content_types = $config->get('content_types');
+    // Handle node entities.
+    if ($entity instanceof \Drupal\node\NodeInterface && isset($form['actions']['delete'])) {
+      if (empty($selected_content_types) || in_array($entity->getType(), array_filter($selected_content_types))) {
+        // Retrieve the configured fields to track from settings.
+        $config = \Drupal::config('content_dependency_tracker.settings');
+        $fields_to_track_config = $config->get('fields_to_track');
+        $fields_to_track = [];
+
+        // Determine which fields to track based on the configuration.
+        if (!empty($fields_to_track_config)) {
+          foreach ($fields_to_track_config as $field_key => $enabled) {
+            if ($enabled) {
+              [$entity_type, $field_name] = explode('.', $field_key, 2);
+              if ($entity_type === 'node') {
+                $fields_to_track[] = $field_name;
+              }
+            }
+          }
+        }
+
+        // Use _content_dependency_tracker_auto_find_references to find referencing entities.
+        $references = _content_dependency_tracker_auto_find_references($entity, $fields_to_track);
+
+        if (!empty($references)) {
+          // Prepare the items to display as links to the referencing entities.
+          $items = [];
+          foreach ($references as $reference) {
+            // Assuming $reference['link'] is a render array or a string containing a link.
+            $items[] = $reference['link'];
+          }
+
+          // Display a warning message and the links under the delete action if references are found.
+          $warning_message = t('Warning: This content is referenced by other content items. Deleting it may affect the integrity of your site.');
+          $form['actions']['delete_warning'] = [
+            '#type' => 'markup',
+            '#markup' => '<div class="messages messages--warning">' . $warning_message . '</div>',
+            '#weight' => 100,
+          ];
+
+          // Add a detailed list of referencing entities.
+          $form['content_dependency_tracker_references'] = [
+            '#type' => 'details',
+            "#group" => "advanced",
+            '#title' => t('Referenced By'),
+            '#open' => TRUE,
+            '#weight' => 90,
+            'items' => [
+              '#theme' => 'item_list',
+              '#items' => $items,
+            ],
+          ];
+        }
+      }
+    }
+    // Handle media entities.
+    if ($entity instanceof \Drupal\media\MediaInterface) {
+      // Check if we are on a media edit form.
+      if (str_contains($form_id, 'media_') && isset($form['actions']['submit'])) {
+        // Find nodes that reference the media entity.
+        $references = _content_dependency_tracker_auto_find_references($entity);
+
+        if (!empty($references)) {
+          // Prepare items to display as links to the referencing nodes.
+          $items = [];
+          foreach ($references as $reference) {
+            // Assuming $reference['link'] is a render array or a string containing a link.
+            $items[] = $reference['link'];
+          }
+
+          // Add a section to the form to display referencing nodes.
+          $form['content_dependency_tracker_references'] = [
+            '#type' => 'details',
+            '#title' => t('Referenced By Nodes'),
+            '#open' => TRUE,
+            '#weight' => 90,
+            'items' => [
+              '#theme' => 'item_list',
+              '#items' => $items,
+            ],
+          ];
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Retrieves all entity reference fields targeting a specific entity type.
+ *
+ * @param string $target_entity_type_id
+ *   The target entity type ID, e.g., 'media'.
+ * @param EntityTypeManagerInterface $entity_type_manager
+ *   The entity type manager service.
+ * @param EntityFieldManagerInterface $entity_field_manager
+ *   The entity field manager service.
+ *
+ * @return array
+ *   An array of field definitions that reference the target entity type.
+ */
+//function get_reference_fields_to_entity_type($target_entity_type_id, EntityTypeManagerInterface $entity_type_manager, EntityFieldManagerInterface $entity_field_manager) {
+//  $reference_fields = [];
+//
+//  // Get all field definitions for all entity types.
+//  $field_definitions = $entity_field_manager->getFieldMap();
+//
+//  foreach ($field_definitions as $entity_type_id => $bundles) {
+//    foreach ($bundles as $bundle => $fields) {
+//      foreach ($fields as $field_name => $field_info) {
+//        // Ensure $field_info is an array and has the 'type' key.
+//        if (is_array($field_info) && isset($field_info['type']) && $field_info['type'] === 'entity_reference') {
+//          // Load the field storage definition to check the target entity type.
+//          $field_storage_definitions = $entity_field_manager->getFieldStorageDefinitions($entity_type_id);
+//          if (isset($field_storage_definitions[$field_name])) {
+//            $field_storage_definition = $field_storage_definitions[$field_name];
+//
+//            if ($field_storage_definition->getSetting('target_type') === $target_entity_type_id) {
+//              // This field references the target entity type, so add it to the list.
+//              $reference_fields[$entity_type_id][$bundle][$field_name] = $field_storage_definition;
+//            }
+//          }
+//        }
+//      }
+//    }
+//  }
+//
+//  return $reference_fields;
+//}
