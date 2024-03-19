@@ -28,7 +28,6 @@ class ContentDependencyTrackerAdminForm extends ConfigFormBase {
   public function buildForm(array $form, FormStateInterface $form_state) {
     $form = parent::buildForm($form, $form_state);
     $config = $this->config('content_dependency_tracker.settings');
-//    var_dump($config);
 
     // Retrieve all entity types with fields.
     $entity_field_manager = \Drupal::service('entity_field.manager');
