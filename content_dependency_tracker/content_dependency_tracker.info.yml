@@ -5,3 +5,5 @@ package: Custom
 core_version_requirement: ^10
 dependencies:
   - drupal:node
+  - drupal:hook_event_dispatcher
+  - drupal:core_event_dispatcher
